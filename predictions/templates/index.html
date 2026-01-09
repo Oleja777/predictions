@@ -10,6 +10,36 @@
         margin: 24px;
         color: #1f2937;
       }
+      #control-panel {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        padding: 12px;
+        border-radius: 8px;
+      }
+      #control-panel label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 14px;
+      }
+      #control-panel input[type="number"] {
+        width: 110px;
+        padding: 4px 6px;
+      }
+      #apply-config {
+        padding: 6px 12px;
+        border: 1px solid #9ca3af;
+        background: #ffffff;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      #apply-config:hover {
+        background: #f3f4f6;
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -33,57 +63,171 @@
     </style>
   </head>
   <body>
+    <div id="control-panel">
+      <label>
+        <input type="checkbox" id="debug-toggle" />
+        Debug mode
+      </label>
+      <label>
+        Volume threshold
+        <input type="number" id="volume-threshold" min="0" step="0.1" />
+      </label>
+      <label>
+        Trades threshold
+        <input type="number" id="trades-threshold" min="0" step="0.1" />
+      </label>
+      <button id="apply-config">Apply</button>
+    </div>
+    <div id="status-text" class="muted" style="margin-top: 8px;"></div>
     <h1>Signals</h1>
     <div class="muted">Auto-refreshes every 60 seconds.</div>
     <table id="signals-table">
-      <thead>
-        <tr>
-          <th>Market</th>
-          <th>Time</th>
-          <th>Vol 15m</th>
-          <th>Trades 15m</th>
-          <th>Price %</th>
-          <th>Vol Anom</th>
-          <th>Trades Anom</th>
-          <th>Top addresses</th>
-        </tr>
-      </thead>
+      <thead></thead>
       <tbody></tbody>
     </table>
 
     <script>
+      const tableHead = document.querySelector('#signals-table thead');
       const tableBody = document.querySelector('#signals-table tbody');
+      const debugToggle = document.querySelector('#debug-toggle');
+      const volumeInput = document.querySelector('#volume-threshold');
+      const tradesInput = document.querySelector('#trades-threshold');
+      const applyButton = document.querySelector('#apply-config');
+      const statusText = document.querySelector('#status-text');
+      let currentConfig = null;
+      let lastRefresh = null;
 
       function formatAddresses(topAddresses) {
         if (!topAddresses || topAddresses.length === 0) return '-';
         return topAddresses.map(entry => `${entry.address} (${entry.count})`).join(', ');
       }
 
+      function formatNumber(value, digits) {
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return '-';
+        return numberValue.toFixed(digits);
+      }
+
+      function renderHeader(debugMode) {
+        const columns = debugMode
+          ? [
+              'Market',
+              'Time',
+              'Vol 15m',
+              'Avg Vol 15m',
+              'Trades 15m',
+              'Avg Trades 15m',
+              'Price %',
+              'Vol Anom',
+              'Trades Anom',
+              'Top addresses',
+              'Reason'
+            ]
+          : [
+              'Market',
+              'Time',
+              'Vol 15m',
+              'Trades 15m',
+              'Price %',
+              'Vol Anom',
+              'Trades Anom',
+              'Top addresses'
+            ];
+        tableHead.innerHTML = `<tr>${columns.map(column => `<th>${column}</th>`).join('')}</tr>`;
+      }
+
       function renderRows(signals) {
+        const debugMode = currentConfig && currentConfig.debug;
         tableBody.innerHTML = '';
         signals.forEach(signal => {
           const row = document.createElement('tr');
-          row.innerHTML = `
-            <td>${signal.market}</td>
-            <td>${new Date(signal.timestamp).toLocaleString()}</td>
-            <td>${Number(signal.vol_15m).toFixed(4)}</td>
-            <td>${signal.trades_15m}</td>
-            <td>${Number(signal.price_change_pct).toFixed(2)}%</td>
-            <td>${Number(signal.anomaly_volume_ratio).toFixed(2)}x</td>
-            <td>${Number(signal.anomaly_trades_ratio).toFixed(2)}x</td>
-            <td>${formatAddresses(signal.top_addresses)}</td>
-          `;
+          if (debugMode) {
+            const reasonText = signal.is_anomaly ? '-' : (signal.reason || '-');
+            row.innerHTML = `
+              <td>${signal.market}</td>
+              <td>${new Date(signal.timestamp).toLocaleString()}</td>
+              <td>${formatNumber(signal.vol_15m, 4)}</td>
+              <td>${formatNumber(signal.avg_vol_15m, 4)}</td>
+              <td>${signal.trades_15m}</td>
+              <td>${formatNumber(signal.avg_trades_15m, 2)}</td>
+              <td>${formatNumber(signal.price_change_pct, 2)}%</td>
+              <td>${formatNumber(signal.anomaly_volume_ratio, 2)}x</td>
+              <td>${formatNumber(signal.anomaly_trades_ratio, 2)}x</td>
+              <td>${formatAddresses(signal.top_addresses)}</td>
+              <td>${reasonText}</td>
+            `;
+          } else {
+            row.innerHTML = `
+              <td>${signal.market}</td>
+              <td>${new Date(signal.timestamp).toLocaleString()}</td>
+              <td>${formatNumber(signal.vol_15m, 4)}</td>
+              <td>${signal.trades_15m}</td>
+              <td>${formatNumber(signal.price_change_pct, 2)}%</td>
+              <td>${formatNumber(signal.anomaly_volume_ratio, 2)}x</td>
+              <td>${formatNumber(signal.anomaly_trades_ratio, 2)}x</td>
+              <td>${formatAddresses(signal.top_addresses)}</td>
+            `;
+          }
           tableBody.appendChild(row);
         });
+      }
+
+      function updateStatus() {
+        if (!currentConfig) return;
+        const refreshText = lastRefresh ? ` | Last refresh: ${lastRefresh}` : '';
+        statusText.textContent = `Config: debug=${currentConfig.debug}, vol>=${currentConfig.anomaly_volume_threshold}, trades>=${currentConfig.anomaly_trades_threshold}${refreshText}`;
+      }
+
+      async function loadConfig() {
+        const response = await fetch('/api/config');
+        currentConfig = await response.json();
+        debugToggle.checked = Boolean(currentConfig.debug);
+        volumeInput.value = currentConfig.anomaly_volume_threshold;
+        tradesInput.value = currentConfig.anomaly_trades_threshold;
+        renderHeader(currentConfig.debug);
+        updateStatus();
       }
 
       async function fetchSignals() {
         const response = await fetch('/api/signals');
         const signals = await response.json();
+        lastRefresh = new Date().toLocaleString();
+        renderHeader(currentConfig && currentConfig.debug);
         renderRows(signals);
+        updateStatus();
       }
 
-      fetchSignals();
+      async function applyConfig() {
+        const payload = { debug: debugToggle.checked };
+        if (volumeInput.value !== '') {
+          payload.anomaly_volume_threshold = Number(volumeInput.value);
+        }
+        if (tradesInput.value !== '') {
+          payload.anomaly_trades_threshold = Number(tradesInput.value);
+        }
+        const response = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+          statusText.textContent = 'Failed to update config.';
+          return;
+        }
+        currentConfig = await response.json();
+        debugToggle.checked = Boolean(currentConfig.debug);
+        volumeInput.value = currentConfig.anomaly_volume_threshold;
+        tradesInput.value = currentConfig.anomaly_trades_threshold;
+        renderHeader(currentConfig.debug);
+        updateStatus();
+        await fetchSignals();
+      }
+
+      applyButton.addEventListener('click', () => {
+        applyConfig();
+      });
+
+      loadConfig().then(fetchSignals);
       setInterval(fetchSignals, 60000);
     </script>
   </body>

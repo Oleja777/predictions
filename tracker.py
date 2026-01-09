@@ -13,6 +13,62 @@ from urllib.request import Request, urlopen
 from . import config
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    debug: bool
+    anomaly_volume_threshold: float
+    anomaly_trades_threshold: float
+
+
+class RuntimeConfigStore:
+    def __init__(
+        self,
+        debug: bool,
+        anomaly_volume_threshold: float,
+        anomaly_trades_threshold: float,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._config = RuntimeConfig(
+            debug=debug,
+            anomaly_volume_threshold=anomaly_volume_threshold,
+            anomaly_trades_threshold=anomaly_trades_threshold,
+        )
+
+    def get(self) -> RuntimeConfig:
+        with self._lock:
+            return RuntimeConfig(
+                debug=self._config.debug,
+                anomaly_volume_threshold=self._config.anomaly_volume_threshold,
+                anomaly_trades_threshold=self._config.anomaly_trades_threshold,
+            )
+
+    def update(
+        self,
+        debug: Optional[bool] = None,
+        anomaly_volume_threshold: Optional[float] = None,
+        anomaly_trades_threshold: Optional[float] = None,
+    ) -> RuntimeConfig:
+        with self._lock:
+            self._config = RuntimeConfig(
+                debug=self._config.debug if debug is None else debug,
+                anomaly_volume_threshold=(
+                    self._config.anomaly_volume_threshold
+                    if anomaly_volume_threshold is None
+                    else anomaly_volume_threshold
+                ),
+                anomaly_trades_threshold=(
+                    self._config.anomaly_trades_threshold
+                    if anomaly_trades_threshold is None
+                    else anomaly_trades_threshold
+                ),
+            )
+            return RuntimeConfig(
+                debug=self._config.debug,
+                anomaly_volume_threshold=self._config.anomaly_volume_threshold,
+                anomaly_trades_threshold=self._config.anomaly_trades_threshold,
+            )
+
+
 @dataclass
 class TradeRecord:
     timestamp: datetime
@@ -28,11 +84,15 @@ class MarketSignal:
     market_name: str
     timestamp: datetime
     volume_15m: float
+    avg_volume_15m: float
     trades_15m: int
+    avg_trades_15m: float
     price_change_pct: float
     top_addresses: List[Tuple[str, int]]
     anomaly_volume_ratio: float
     anomaly_trades_ratio: float
+    reason: Optional[str] = None
+    is_anomaly: bool = True
 
     def to_row(self) -> Dict[str, Any]:
         return {
@@ -103,24 +163,29 @@ class SignalStore:
                     market_name=row.get("market", ""),
                     timestamp=timestamp,
                     volume_15m=float(row.get("vol_15m", 0)),
+                    avg_volume_15m=0.0,
                     trades_15m=int(float(row.get("trades_15m", 0))),
+                    avg_trades_15m=0.0,
                     price_change_pct=float(row.get("price_change_pct", 0)),
                     top_addresses=top_addresses,
                     anomaly_volume_ratio=float(row.get("anomaly_volume_ratio", 0)),
                     anomaly_trades_ratio=float(row.get("anomaly_trades_ratio", 0)),
+                    reason=None,
+                    is_anomaly=True,
                 )
                 self.signals.append(signal)
 
-    def append(self, signal: MarketSignal) -> None:
-        file_exists = self.csv_path.exists()
-        with self.csv_path.open("a", newline="") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=list(signal.to_row().keys()),
-            )
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(signal.to_row())
+    def append(self, signal: MarketSignal, write_csv: bool = True) -> None:
+        if write_csv:
+            file_exists = self.csv_path.exists()
+            with self.csv_path.open("a", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=list(signal.to_row().keys()),
+                )
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(signal.to_row())
         self.signals.append(signal)
 
     def list_signals(self) -> List[MarketSignal]:
@@ -128,9 +193,15 @@ class SignalStore:
 
 
 class MarketTracker:
-    def __init__(self, client: PolymarketClient, store: SignalStore) -> None:
+    def __init__(
+        self,
+        client: PolymarketClient,
+        store: SignalStore,
+        runtime_config_store: RuntimeConfigStore,
+    ) -> None:
         self.client = client
         self.store = store
+        self.runtime_config_store = runtime_config_store
         self.market_trades: Dict[str, Deque[TradeRecord]] = {}
         self.last_seen_ids: Dict[str, set] = {}
         self._lock = threading.Lock()
@@ -179,29 +250,41 @@ class MarketTracker:
             trades.popleft()
 
     def _compute_signal(
-        self, market_id: str, market_name: str, trades: Deque[TradeRecord]
-    ) -> Optional[MarketSignal]:
+        self,
+        market_id: str,
+        market_name: str,
+        trades: Deque[TradeRecord],
+        runtime_config: RuntimeConfig,
+    ) -> MarketSignal:
         now = datetime.now(tz=timezone.utc)
         window_15m = now - timedelta(minutes=15)
         last_24h = [trade for trade in trades if trade.timestamp >= now - timedelta(hours=24)]
         last_15m = [trade for trade in trades if trade.timestamp >= window_15m]
-        if not last_15m:
-            return None
-
-        volume_15m = sum(trade.size for trade in last_15m)
-        trades_15m = len(last_15m)
         total_volume_24h = sum(trade.size for trade in last_24h)
         total_trades_24h = len(last_24h)
         avg_volume_15m = total_volume_24h / 96 if total_volume_24h > 0 else 0
         avg_trades_15m = total_trades_24h / 96 if total_trades_24h > 0 else 0
+        if not last_15m:
+            return MarketSignal(
+                market_id=market_id,
+                market_name=market_name,
+                timestamp=now,
+                volume_15m=0.0,
+                avg_volume_15m=avg_volume_15m,
+                trades_15m=0,
+                avg_trades_15m=avg_trades_15m,
+                price_change_pct=0.0,
+                top_addresses=[],
+                anomaly_volume_ratio=0.0,
+                anomaly_trades_ratio=0.0,
+                reason="data_missing",
+                is_anomaly=False,
+            )
+
+        volume_15m = sum(trade.size for trade in last_15m)
+        trades_15m = len(last_15m)
         anomaly_volume_ratio = volume_15m / avg_volume_15m if avg_volume_15m else 0
         anomaly_trades_ratio = trades_15m / avg_trades_15m if avg_trades_15m else 0
-
-        if (
-            anomaly_volume_ratio < config.ANOMALY_VOLUME_THRESHOLD
-            and anomaly_trades_ratio < config.ANOMALY_TRADES_THRESHOLD
-        ):
-            return None
 
         first_price = last_15m[0].price
         last_price = last_15m[-1].price
@@ -215,20 +298,38 @@ class MarketTracker:
                 address_counter[trade.taker] += 1
         top_addresses = address_counter.most_common(config.TOP_ADDRESS_COUNT)
 
+        is_anomaly = (
+            anomaly_volume_ratio >= runtime_config.anomaly_volume_threshold
+            or anomaly_trades_ratio >= runtime_config.anomaly_trades_threshold
+        )
+        reason = None
+        if not is_anomaly:
+            reasons = []
+            if anomaly_volume_ratio < runtime_config.anomaly_volume_threshold:
+                reasons.append("vol<th")
+            if anomaly_trades_ratio < runtime_config.anomaly_trades_threshold:
+                reasons.append("trades<th")
+            reason = ",".join(reasons) if reasons else "below_thresholds"
+
         return MarketSignal(
             market_id=market_id,
             market_name=market_name,
             timestamp=now,
             volume_15m=volume_15m,
+            avg_volume_15m=avg_volume_15m,
             trades_15m=trades_15m,
+            avg_trades_15m=avg_trades_15m,
             price_change_pct=price_change_pct,
             top_addresses=top_addresses,
             anomaly_volume_ratio=anomaly_volume_ratio,
             anomaly_trades_ratio=anomaly_trades_ratio,
+            reason=reason,
+            is_anomaly=is_anomaly,
         )
 
     def poll_once(self) -> List[MarketSignal]:
         signals: List[MarketSignal] = []
+        runtime_config = self.runtime_config_store.get()
         markets = self.client.get_active_markets()
         for market in markets:
             market_id = str(market.get("id") or market.get("market_id"))
@@ -252,17 +353,20 @@ class MarketTracker:
                 trade = self._normalize_trade(trade_raw)
                 if trade:
                     trades.append(trade)
-            if not trades:
+            if not trades and not runtime_config.debug:
                 continue
-            trades.sort(key=lambda t: t.timestamp)
             with self._lock:
                 trade_deque = self.market_trades.setdefault(market_id, deque())
-                trade_deque.extend(trades)
+                if trades:
+                    trades.sort(key=lambda t: t.timestamp)
+                    trade_deque.extend(trades)
                 self._purge_old(trade_deque)
-                signal = self._compute_signal(market_id, market_name, trade_deque)
-            if signal:
-                self.store.append(signal)
+                signal = self._compute_signal(market_id, market_name, trade_deque, runtime_config)
+            if signal.is_anomaly:
+                self.store.append(signal, write_csv=True)
                 signals.append(signal)
+            elif runtime_config.debug:
+                self.store.append(signal, write_csv=False)
         return signals
 
 

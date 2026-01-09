@@ -3,12 +3,19 @@ import os
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from . import config
-from .tracker import MarketSignal, MarketTracker, PolymarketClient, SignalStore, TrackerService
+from .tracker import (
+    MarketSignal,
+    MarketTracker,
+    PolymarketClient,
+    RuntimeConfigStore,
+    SignalStore,
+    TrackerService,
+)
 
 
 class TelegramNotifier:
@@ -36,9 +43,14 @@ class TelegramNotifier:
             return
 
 
+runtime_config_store = RuntimeConfigStore(
+    debug=False,
+    anomaly_volume_threshold=config.ANOMALY_VOLUME_THRESHOLD,
+    anomaly_trades_threshold=config.ANOMALY_TRADES_THRESHOLD,
+)
 store = SignalStore(config.SIGNAL_CSV_PATH)
 client = PolymarketClient(config.POLYMARKET_BASE_URL)
-tracker = MarketTracker(client, store)
+tracker = MarketTracker(client, store, runtime_config_store)
 notifier = TelegramNotifier()
 
 
@@ -50,16 +62,20 @@ def _notify(signals: List[MarketSignal]) -> None:
 service = TrackerService(tracker, on_signals=_notify)
 
 
-def _serialize_signals(signals: List[MarketSignal]) -> List[Dict[str, Any]]:
+def _serialize_signals(signals: List[MarketSignal], include_all: bool) -> List[Dict[str, Any]]:
     data: List[Dict[str, Any]] = []
     for signal in signals:
+        if not include_all and not signal.is_anomaly:
+            continue
         data.append(
             {
                 "market_id": signal.market_id,
                 "market": signal.market_name,
                 "timestamp": signal.timestamp.isoformat(),
                 "vol_15m": signal.volume_15m,
+                "avg_vol_15m": signal.avg_volume_15m,
                 "trades_15m": signal.trades_15m,
+                "avg_trades_15m": signal.avg_trades_15m,
                 "price_change_pct": signal.price_change_pct,
                 "top_addresses": [
                     {"address": addr, "count": count}
@@ -67,9 +83,42 @@ def _serialize_signals(signals: List[MarketSignal]) -> List[Dict[str, Any]]:
                 ],
                 "anomaly_volume_ratio": signal.anomaly_volume_ratio,
                 "anomaly_trades_ratio": signal.anomaly_trades_ratio,
+                "reason": signal.reason,
+                "is_anomaly": signal.is_anomaly,
             }
         )
     return data
+
+
+def _serialize_runtime_config(config_obj: Any) -> Dict[str, Any]:
+    return {
+        "debug": config_obj.debug,
+        "anomaly_volume_threshold": config_obj.anomaly_volume_threshold,
+        "anomaly_trades_threshold": config_obj.anomaly_trades_threshold,
+    }
+
+
+def _parse_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _load_index_html() -> bytes:
@@ -99,12 +148,61 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(_load_index_html())
             return
         if parsed.path == "/api/signals":
-            signals = _serialize_signals(store.list_signals())
+            runtime_config = runtime_config_store.get()
+            signals = _serialize_signals(store.list_signals(), runtime_config.debug)
             self._send_json(signals)
+            return
+        if parsed.path == "/api/config":
+            self._send_json(_serialize_runtime_config(runtime_config_store.get()))
             return
         if parsed.path == "/api/health":
             self._send_json({"status": "ok", "timestamp": datetime.now(tz=timezone.utc).isoformat()})
             return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/config":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length) if length else b""
+            try:
+                payload = json.loads(raw_body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid_json"}, status_code=400)
+                return
+
+            errors = []
+            debug_value = None
+            if "debug" in payload:
+                debug_value = _parse_bool(payload.get("debug"))
+                if debug_value is None:
+                    errors.append("debug")
+
+            volume_value = None
+            if "anomaly_volume_threshold" in payload:
+                volume_value = _parse_float(payload.get("anomaly_volume_threshold"))
+                if volume_value is None:
+                    errors.append("anomaly_volume_threshold")
+
+            trades_value = None
+            if "anomaly_trades_threshold" in payload:
+                trades_value = _parse_float(payload.get("anomaly_trades_threshold"))
+                if trades_value is None:
+                    errors.append("anomaly_trades_threshold")
+
+            if errors:
+                self._send_json({"error": "invalid_fields", "fields": errors}, status_code=400)
+                return
+
+            updated = runtime_config_store.update(
+                debug=debug_value,
+                anomaly_volume_threshold=volume_value,
+                anomaly_trades_threshold=trades_value,
+            )
+            self._send_json(_serialize_runtime_config(updated))
+            return
+
         self.send_response(404)
         self.end_headers()
 
