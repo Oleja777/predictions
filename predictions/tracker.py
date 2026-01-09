@@ -374,7 +374,17 @@ class MarketTracker:
                 or market.get("market_id")
                 or market.get("conditionId")
             )
-            if not market_id:
+            if not market_id or market_id == "None":
+                if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                    market_name = (
+                        market.get("question")
+                        or market.get("name")
+                        or market.get("market_title")
+                        or ""
+                    )
+                    debug_snapshot.append(
+                        self._empty_signal("", market_name, "data missing")
+                    )
                 continue
             market_name = (
                 market.get("question") or market.get("name") or market.get("market_title") or market_id
@@ -436,7 +446,7 @@ class MarketTracker:
                         self._empty_signal(
                             market_id,
                             market_name,
-                            f"error: {type(exc).__name__}",
+                            f"error: {exc}",
                         )
                     )
                 continue
