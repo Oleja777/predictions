@@ -207,6 +207,10 @@ class MarketTracker:
         self.last_seen_ids: Dict[str, set] = {}
         self._debug_snapshot: List[MarketSignal] = []
         self._debug_lock = threading.Lock()
+        self._last_poll_at: Optional[datetime] = None
+        self._markets_seen: int = 0
+        self._last_error: Optional[str] = None
+        self._stats_lock = threading.Lock()
         self._lock = threading.Lock()
 
     def get_debug_snapshot(self) -> List[MarketSignal]:
@@ -216,6 +220,29 @@ class MarketTracker:
     def _set_debug_snapshot(self, snapshot: List[MarketSignal]) -> None:
         with self._debug_lock:
             self._debug_snapshot = snapshot
+
+    def _set_stats(
+        self,
+        last_poll_at: Optional[datetime] = None,
+        markets_seen: Optional[int] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        with self._stats_lock:
+            if last_poll_at is not None:
+                self._last_poll_at = last_poll_at
+            if markets_seen is not None:
+                self._markets_seen = markets_seen
+            if last_error is not None or last_error is None:
+                self._last_error = last_error
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._stats_lock:
+            return {
+                "last_poll_at": self._last_poll_at.isoformat() if self._last_poll_at else None,
+                "markets_seen": self._markets_seen,
+                "debug_snapshot_size": len(self.get_debug_snapshot()),
+                "last_error": self._last_error,
+            }
 
     def _empty_signal(
         self,
@@ -360,13 +387,29 @@ class MarketTracker:
         runtime_config = self.runtime_config_store.get()
         debug_snapshot: List[MarketSignal] = []
         debug_limit = 500
-        markets = self.client.get_active_markets()
+        poll_time = datetime.now(tz=timezone.utc)
+        self._set_stats(last_poll_at=poll_time, last_error=None)
+        processed_any = False
+        try:
+            markets = self.client.get_active_markets()
+            self._set_stats(markets_seen=len(markets))
+        except Exception as exc:
+            self._set_stats(last_error=f"error: {exc}")
+            if runtime_config.debug:
+                debug_snapshot.append(
+                    self._empty_signal("", "system", f"error: {exc}")
+                )
+                self._set_debug_snapshot(debug_snapshot)
+            return signals
+
         if not markets:
             if runtime_config.debug:
-                self._set_debug_snapshot(
-                    [self._empty_signal("", "", "no markets returned")]
+                debug_snapshot.append(
+                    self._empty_signal("", "system", "no markets returned")
                 )
+                self._set_debug_snapshot(debug_snapshot)
             return signals
+
         for market in markets:
             market_id = str(
                 market.get("condition_id")
@@ -385,9 +428,13 @@ class MarketTracker:
                     debug_snapshot.append(
                         self._empty_signal("", market_name, "data missing")
                     )
+                    processed_any = True
                 continue
             market_name = (
-                market.get("question") or market.get("name") or market.get("market_title") or market_id
+                market.get("question")
+                or market.get("name")
+                or market.get("market_title")
+                or market_id
             )
             try:
                 trades_raw = self.client.get_recent_trades(market_id)
@@ -407,6 +454,7 @@ class MarketTracker:
                     reason = "data missing" if trades_raw else "no trades"
                     if runtime_config.debug and len(debug_snapshot) < debug_limit:
                         debug_snapshot.append(self._empty_signal(market_id, market_name, reason))
+                        processed_any = True
                     if not runtime_config.debug:
                         continue
                     else:
@@ -426,11 +474,20 @@ class MarketTracker:
                     )
             except HTTPError as exc:
                 if exc.code in {401, 403}:
+                    self._set_stats(
+                        last_error="unauthorized: CLOB /trades requires API key (L2 auth)"
+                    )
                     if runtime_config.debug and len(debug_snapshot) < debug_limit:
                         debug_snapshot.append(
-                            self._empty_signal(market_id, market_name, "unauthorized")
+                            self._empty_signal(
+                                market_id,
+                                market_name,
+                                "unauthorized: CLOB /trades requires API key (L2 auth)",
+                            )
                         )
+                        processed_any = True
                 else:
+                    self._set_stats(last_error=f"error: {exc.code}")
                     if runtime_config.debug and len(debug_snapshot) < debug_limit:
                         debug_snapshot.append(
                             self._empty_signal(
@@ -439,8 +496,10 @@ class MarketTracker:
                                 f"error: {exc.code}",
                             )
                         )
+                        processed_any = True
                 continue
             except Exception as exc:
+                self._set_stats(last_error=f"error: {exc}")
                 if runtime_config.debug and len(debug_snapshot) < debug_limit:
                     debug_snapshot.append(
                         self._empty_signal(
@@ -449,6 +508,7 @@ class MarketTracker:
                             f"error: {exc}",
                         )
                     )
+                    processed_any = True
                 continue
 
             if signal.is_anomaly:
@@ -456,7 +516,12 @@ class MarketTracker:
                 signals.append(signal)
             if runtime_config.debug and len(debug_snapshot) < debug_limit:
                 debug_snapshot.append(signal)
+                processed_any = True
         if runtime_config.debug:
+            if not processed_any and len(debug_snapshot) < debug_limit:
+                debug_snapshot.append(
+                    self._empty_signal("", "system", "no markets processed")
+                )
             self._set_debug_snapshot(debug_snapshot)
         return signals
 

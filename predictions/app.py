@@ -159,6 +159,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/config":
             self._send_json(_serialize_runtime_config(runtime_config_store.get()))
             return
+        if parsed.path == "/api/debug":
+            self._send_json(tracker.get_stats())
+            return
         if parsed.path == "/api/health":
             self._send_json({"status": "ok", "timestamp": datetime.now(tz=timezone.utc).isoformat()})
             return
