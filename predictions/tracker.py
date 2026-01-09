@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from . import config
@@ -361,14 +362,16 @@ class MarketTracker:
         debug_limit = 500
         markets = self.client.get_active_markets()
         for market in markets:
-            market_id = str(market.get("id") or market.get("market_id"))
+            market_id = str(
+                market.get("condition_id")
+                or market.get("id")
+                or market.get("market_id")
+                or market.get("conditionId")
+            )
             if not market_id:
                 continue
             market_name = (
-                market.get("question")
-                or market.get("name")
-                or market.get("market_title")
-                or market_id
+                market.get("question") or market.get("name") or market.get("market_title") or market_id
             )
             try:
                 trades_raw = self.client.get_recent_trades(market_id)
@@ -405,10 +408,30 @@ class MarketTracker:
                         runtime_config,
                         empty_reason="no trades",
                     )
+            except HTTPError as exc:
+                if exc.code in {401, 403}:
+                    if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                        debug_snapshot.append(
+                            self._empty_signal(market_id, market_name, "unauthorized")
+                        )
+                else:
+                    if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                        debug_snapshot.append(
+                            self._empty_signal(
+                                market_id,
+                                market_name,
+                                f"error: {exc.code}",
+                            )
+                        )
+                continue
             except Exception as exc:
                 if runtime_config.debug and len(debug_snapshot) < debug_limit:
                     debug_snapshot.append(
-                        self._empty_signal(market_id, market_name, f"error: {exc}")
+                        self._empty_signal(
+                            market_id,
+                            market_name,
+                            f"error: {type(exc).__name__}",
+                        )
                     )
                 continue
 
