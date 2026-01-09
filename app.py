@@ -181,15 +181,23 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             volume_value = None
             if "anomaly_volume_threshold" in payload:
-                volume_value = _parse_float(payload.get("anomaly_volume_threshold"))
-                if volume_value is None:
-                    errors.append("anomaly_volume_threshold")
+                raw_value = payload.get("anomaly_volume_threshold")
+                if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                    volume_value = None
+                else:
+                    volume_value = _parse_float(raw_value)
+                    if volume_value is None:
+                        errors.append("anomaly_volume_threshold")
 
             trades_value = None
             if "anomaly_trades_threshold" in payload:
-                trades_value = _parse_float(payload.get("anomaly_trades_threshold"))
-                if trades_value is None:
-                    errors.append("anomaly_trades_threshold")
+                raw_value = payload.get("anomaly_trades_threshold")
+                if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                    trades_value = None
+                else:
+                    trades_value = _parse_float(raw_value)
+                    if trades_value is None:
+                        errors.append("anomaly_trades_threshold")
 
             if errors:
                 self._send_json({"error": "invalid_fields", "fields": errors}, status_code=400)
