@@ -361,6 +361,12 @@ class MarketTracker:
         debug_snapshot: List[MarketSignal] = []
         debug_limit = 500
         markets = self.client.get_active_markets()
+        if not markets:
+            if runtime_config.debug:
+                self._set_debug_snapshot(
+                    [self._empty_signal("", "", "no markets returned")]
+                )
+            return signals
         for market in markets:
             market_id = str(
                 market.get("condition_id")
