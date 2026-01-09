@@ -85,6 +85,7 @@ def _serialize_signals(signals: List[MarketSignal], include_all: bool) -> List[D
                 "anomaly_trades_ratio": signal.anomaly_trades_ratio,
                 "reason": signal.reason,
                 "is_anomaly": signal.is_anomaly,
+                "passed": signal.is_anomaly,
             }
         )
     return data
@@ -149,7 +150,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/signals":
             runtime_config = runtime_config_store.get()
-            signals = _serialize_signals(store.list_signals(), runtime_config.debug)
+            if runtime_config.debug:
+                signals = _serialize_signals(tracker.get_debug_snapshot(), include_all=True)
+            else:
+                signals = _serialize_signals(store.list_signals(), include_all=False)
             self._send_json(signals)
             return
         if parsed.path == "/api/config":

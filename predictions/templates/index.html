@@ -142,7 +142,7 @@
         signals.forEach(signal => {
           const row = document.createElement('tr');
           if (debugMode) {
-            const reasonText = signal.is_anomaly ? '-' : (signal.reason || '-');
+            const reasonText = signal.reason || '-';
             row.innerHTML = `
               <td>${signal.market}</td>
               <td>${new Date(signal.timestamp).toLocaleString()}</td>

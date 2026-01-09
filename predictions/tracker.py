@@ -204,7 +204,42 @@ class MarketTracker:
         self.runtime_config_store = runtime_config_store
         self.market_trades: Dict[str, Deque[TradeRecord]] = {}
         self.last_seen_ids: Dict[str, set] = {}
+        self._debug_snapshot: List[MarketSignal] = []
+        self._debug_lock = threading.Lock()
         self._lock = threading.Lock()
+
+    def get_debug_snapshot(self) -> List[MarketSignal]:
+        with self._debug_lock:
+            return list(self._debug_snapshot)
+
+    def _set_debug_snapshot(self, snapshot: List[MarketSignal]) -> None:
+        with self._debug_lock:
+            self._debug_snapshot = snapshot
+
+    def _empty_signal(
+        self,
+        market_id: str,
+        market_name: str,
+        reason: str,
+        avg_volume_15m: float = 0.0,
+        avg_trades_15m: float = 0.0,
+    ) -> MarketSignal:
+        now = datetime.now(tz=timezone.utc)
+        return MarketSignal(
+            market_id=market_id,
+            market_name=market_name,
+            timestamp=now,
+            volume_15m=0.0,
+            avg_volume_15m=avg_volume_15m,
+            trades_15m=0,
+            avg_trades_15m=avg_trades_15m,
+            price_change_pct=0.0,
+            top_addresses=[],
+            anomaly_volume_ratio=0.0,
+            anomaly_trades_ratio=0.0,
+            reason=reason,
+            is_anomaly=False,
+        )
 
     def _parse_timestamp(self, raw: Any) -> Optional[datetime]:
         if raw is None:
@@ -255,6 +290,7 @@ class MarketTracker:
         market_name: str,
         trades: Deque[TradeRecord],
         runtime_config: RuntimeConfig,
+        empty_reason: str = "no trades",
     ) -> MarketSignal:
         now = datetime.now(tz=timezone.utc)
         window_15m = now - timedelta(minutes=15)
@@ -265,20 +301,12 @@ class MarketTracker:
         avg_volume_15m = total_volume_24h / 96 if total_volume_24h > 0 else 0
         avg_trades_15m = total_trades_24h / 96 if total_trades_24h > 0 else 0
         if not last_15m:
-            return MarketSignal(
+            return self._empty_signal(
                 market_id=market_id,
                 market_name=market_name,
-                timestamp=now,
-                volume_15m=0.0,
+                reason=empty_reason,
                 avg_volume_15m=avg_volume_15m,
-                trades_15m=0,
                 avg_trades_15m=avg_trades_15m,
-                price_change_pct=0.0,
-                top_addresses=[],
-                anomaly_volume_ratio=0.0,
-                anomaly_trades_ratio=0.0,
-                reason="data_missing",
-                is_anomaly=False,
             )
 
         volume_15m = sum(trade.size for trade in last_15m)
@@ -302,14 +330,13 @@ class MarketTracker:
             anomaly_volume_ratio >= runtime_config.anomaly_volume_threshold
             or anomaly_trades_ratio >= runtime_config.anomaly_trades_threshold
         )
-        reason = None
-        if not is_anomaly:
-            reasons = []
-            if anomaly_volume_ratio < runtime_config.anomaly_volume_threshold:
-                reasons.append("vol<th")
-            if anomaly_trades_ratio < runtime_config.anomaly_trades_threshold:
-                reasons.append("trades<th")
-            reason = ",".join(reasons) if reasons else "below_thresholds"
+        if is_anomaly:
+            reason = "passed"
+        else:
+            reason = (
+                "below thresholds (vol="
+                f"{anomaly_volume_ratio:.2f}, trades={anomaly_trades_ratio:.2f})"
+            )
 
         return MarketSignal(
             market_id=market_id,
@@ -330,6 +357,8 @@ class MarketTracker:
     def poll_once(self) -> List[MarketSignal]:
         signals: List[MarketSignal] = []
         runtime_config = self.runtime_config_store.get()
+        debug_snapshot: List[MarketSignal] = []
+        debug_limit = 500
         markets = self.client.get_active_markets()
         for market in markets:
             market_id = str(market.get("id") or market.get("market_id"))
@@ -341,32 +370,55 @@ class MarketTracker:
                 or market.get("market_title")
                 or market_id
             )
-            trades_raw = self.client.get_recent_trades(market_id)
-            trades = []
-            for trade_raw in trades_raw:
-                trade_id = trade_raw.get("id") or trade_raw.get("trade_id")
-                if trade_id is not None:
-                    seen = self.last_seen_ids.setdefault(market_id, set())
-                    if trade_id in seen:
+            try:
+                trades_raw = self.client.get_recent_trades(market_id)
+                trades_raw = trades_raw or []
+                trades = []
+                for trade_raw in trades_raw:
+                    trade_id = trade_raw.get("id") or trade_raw.get("trade_id")
+                    if trade_id is not None:
+                        seen = self.last_seen_ids.setdefault(market_id, set())
+                        if trade_id in seen:
+                            continue
+                        seen.add(trade_id)
+                    trade = self._normalize_trade(trade_raw)
+                    if trade:
+                        trades.append(trade)
+                if not trades:
+                    reason = "data missing" if trades_raw else "no trades"
+                    if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                        debug_snapshot.append(self._empty_signal(market_id, market_name, reason))
+                    if not runtime_config.debug:
                         continue
-                    seen.add(trade_id)
-                trade = self._normalize_trade(trade_raw)
-                if trade:
-                    trades.append(trade)
-            if not trades and not runtime_config.debug:
+                    else:
+                        continue
+                with self._lock:
+                    trade_deque = self.market_trades.setdefault(market_id, deque())
+                    if trades:
+                        trades.sort(key=lambda t: t.timestamp)
+                        trade_deque.extend(trades)
+                    self._purge_old(trade_deque)
+                    signal = self._compute_signal(
+                        market_id,
+                        market_name,
+                        trade_deque,
+                        runtime_config,
+                        empty_reason="no trades",
+                    )
+            except Exception as exc:
+                if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                    debug_snapshot.append(
+                        self._empty_signal(market_id, market_name, f"error: {exc}")
+                    )
                 continue
-            with self._lock:
-                trade_deque = self.market_trades.setdefault(market_id, deque())
-                if trades:
-                    trades.sort(key=lambda t: t.timestamp)
-                    trade_deque.extend(trades)
-                self._purge_old(trade_deque)
-                signal = self._compute_signal(market_id, market_name, trade_deque, runtime_config)
+
             if signal.is_anomaly:
                 self.store.append(signal, write_csv=True)
                 signals.append(signal)
-            elif runtime_config.debug:
-                self.store.append(signal, write_csv=False)
+            if runtime_config.debug and len(debug_snapshot) < debug_limit:
+                debug_snapshot.append(signal)
+        if runtime_config.debug:
+            self._set_debug_snapshot(debug_snapshot)
         return signals
 
 
