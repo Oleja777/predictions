@@ -474,18 +474,16 @@ class MarketTracker:
                     )
             except HTTPError as exc:
                 if exc.code in {401, 403}:
-                    self._set_stats(
-                        last_error="unauthorized: CLOB /trades requires API key (L2 auth)"
-                    )
                     if runtime_config.debug and len(debug_snapshot) < debug_limit:
                         debug_snapshot.append(
                             self._empty_signal(
                                 market_id,
                                 market_name,
-                                "unauthorized: CLOB /trades requires API key (L2 auth)",
+                                "unauthorized",
                             )
                         )
                         processed_any = True
+                    self._set_stats(last_error="unauthorized")
                 else:
                     self._set_stats(last_error=f"error: {exc.code}")
                     if runtime_config.debug and len(debug_snapshot) < debug_limit:
