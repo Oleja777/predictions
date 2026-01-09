@@ -390,18 +390,23 @@ class MarketTracker:
         poll_time = datetime.now(tz=timezone.utc)
         self._set_stats(last_poll_at=poll_time, last_error=None)
         processed_any = False
+        fatal_error = False
         try:
             markets = self.client.get_active_markets()
             self._set_stats(markets_seen=len(markets))
+        except Exception as exc:
+            self._set_stats(last_error=f"error: {exc}")
+            if runtime_config.debug:
+                debug_snapshot.append(self._empty_signal("", "", f"error: {exc}"))
+            fatal_error = True
+            markets = []
 
+        if not fatal_error:
             if not markets:
                 if runtime_config.debug:
                     debug_snapshot.append(
                         self._empty_signal("", "system", "no markets returned")
                     )
-                    self._set_debug_snapshot(debug_snapshot)
-                return signals
-
             for market in markets:
                 market_id = str(
                     market.get("condition_id")
@@ -509,20 +514,14 @@ class MarketTracker:
                 if runtime_config.debug and len(debug_snapshot) < debug_limit:
                     debug_snapshot.append(signal)
                     processed_any = True
-            if runtime_config.debug:
-                if not processed_any and len(debug_snapshot) < debug_limit:
-                    debug_snapshot.append(
-                        self._empty_signal("", "system", "no markets processed")
-                    )
-                self._set_debug_snapshot(debug_snapshot)
-            return signals
-        except Exception as exc:
-            self._set_stats(last_error=f"error: {exc}")
-            if runtime_config.debug:
-                self._set_debug_snapshot(
-                    [self._empty_signal("", "", f"error: {exc}")]
+
+        if runtime_config.debug:
+            if not debug_snapshot and len(debug_snapshot) < debug_limit:
+                debug_snapshot.append(
+                    self._empty_signal("", "system", "no markets processed")
                 )
-            return signals
+            self._set_debug_snapshot(debug_snapshot)
+        return signals
 
 
 class TrackerService:
